@@ -94,7 +94,9 @@ for option; do
 
     case $dashdash$option in
         --)
-            dashdash=yes ;;
+            dashdash=yes
+            shift
+            break;;
         -h|--help)
             cat <<EOF
 ovs-sandbox, for starting a sandboxed dummy Open vSwitch environment
@@ -464,7 +466,7 @@ Log files, pidfiles, and the configuration database are in the
 Exit the shell to kill the running daemons.
 EOF
 
-status=0; $SHELL || status=$?
+status=0; $SHELL $@|| status=$?
 
 cat <<EOF
 ----------------------------------------------------------------------
