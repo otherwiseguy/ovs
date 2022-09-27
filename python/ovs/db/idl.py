@@ -1075,11 +1075,12 @@ class Idl(object):
                           'leader; trying another server' % session_name)
                 return False
             if database.index:
-                if database.index[0] < self._min_index:
+                db_index = next(iter(database.index))
+                if db_index < self._min_index:
                     vlog.warn('%s: clustered database server has stale data; '
                               'trying another server' % session_name)
                     return False
-                self._min_index = database.index[0]
+                self._min_index = db_index
         elif database.model == RELAY:
             if not database.schema:
                 vlog.info('%s: relay database server has not yet connected '

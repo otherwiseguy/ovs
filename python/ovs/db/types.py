@@ -58,7 +58,7 @@ class AtomicType(object):
             return 's'
         return self.name
 
-    def to_json(self):
+    def to_json(self, sort=False):
         return self.name
 
     def default_atom(self):
@@ -218,14 +218,14 @@ class BaseType(object):
 
         return base
 
-    def to_json(self):
+    def to_json(self, sort=False):
         if not self.has_constraints():
-            return self.type.to_json()
+            return self.type.to_json(sort=sort)
 
-        json = {'type': self.type.to_json()}
+        json = {'type': self.type.to_json(sort=sort)}
 
         if self.enum:
-            json['enum'] = self.enum.to_json()
+            json['enum'] = self.enum.to_json(sort=sort)
 
         if self.type == IntegerType:
             if self.min is not None:

@@ -95,7 +95,7 @@ def do_parse_atomic_type(type_string):
 def do_parse_base_type(type_string):
     type_json = unbox_json(ovs.json.from_string(type_string))
     base_type = ovs.db.types.BaseType.from_json(type_json)
-    print(ovs.json.to_string(base_type.to_json(), sort_keys=True))
+    print(ovs.json.to_string(base_type.to_json(sort=True), sort_keys=True))
 
 
 def do_parse_type(type_string):
@@ -122,7 +122,7 @@ def do_parse_data(type_string, *data_strings):
     for datum_string in data_strings:
         datum_json = unbox_json(ovs.json.from_string(datum_string))
         datum = data.Datum.from_json(type_, datum_json)
-        print(ovs.json.to_string(datum.to_json()))
+        print(ovs.json.to_string(datum.to_json(sort=True)))
 
 
 def do_sort_atoms(type_string, atom_strings):
@@ -162,7 +162,7 @@ def get_simple_printable_row_string(row, columns):
             if isinstance(value, dict):
                 value = sorted((row_to_uuid(k), row_to_uuid(v))
                                for k, v in value.items())
-            if isinstance(value, (list, tuple)):
+            if isinstance(value, (list, tuple, set)):
                 value = sorted((row_to_uuid(v) for v in value))
             elif isinstance(value, list):
                 value = sorted(row_to_uuid(v) for v in value)
@@ -217,14 +217,14 @@ def get_link1_table_printable_row(row):
         s.append(' '.join(sorted(str(ka.i) for ka in row.ka)))
         s.append("] l2=")
     if hasattr(row, "l2") and row.l2:
-        s.append(str(row.l2[0].i))
+        s.append(str(next(iter(row.l2)).i))
     return ''.join(s)
 
 
 def get_link2_table_printable_row(row):
     s = "i=%s l1=" % row.i
     if hasattr(row, "l1") and row.l1:
-        s += str(row.l1[0].i)
+        s += str(next(iter(row.l1)).i)
     return s
 
 

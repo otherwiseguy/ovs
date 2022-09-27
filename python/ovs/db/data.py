@@ -189,7 +189,7 @@ class Atom(object):
                     '"%s" length %d is greater than maximum allowed '
                     'length %d' % (s, length, base.max_length))
 
-    def to_json(self):
+    def to_json(self, sort=False):
         if self.type == ovs.db.types.UuidType:
             return ovs.ovsuuid.to_json(self.value)
         else:
@@ -378,15 +378,16 @@ class Datum(object):
             keyAtom = Atom.from_json(type_.key, json, symtab)
             return Datum(type_, {keyAtom: None})
 
-    def to_json(self):
+    def to_json(self, sort=False):
+        _sorted = sorted if sort else lambda x: x
         if self.type.is_map():
             return ["map", [[k.to_json(), v.to_json()]
-                            for k, v in sorted(self.values.items())]]
+                            for k, v in _sorted(self.values.items())]]
         elif len(self.values) == 1:
             key = next(iter(self.values.keys()))
             return key.to_json()
         else:
-            return ["set", [k.to_json() for k in sorted(self.values.keys())]]
+            return ["set", [k.to_json() for k in _sorted(self.values.keys())]]
 
     def to_string(self):
         head = tail = None
@@ -501,7 +502,7 @@ class Datum(object):
                 dk = uuid_to_row(k.value, self.type.key)
                 if dk is not None:
                     s.add(dk)
-            return sorted(s)
+            return s
 
     @staticmethod
     def from_python(type_, value, row_to_uuid):
