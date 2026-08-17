@@ -365,6 +365,12 @@ class Idl(object):
         method for documentation."""
         self.cs.set_db_change_aware(db_change_aware)
 
+    def set_jsonrpc_options(self, probe_interval=None, max_backoff=None):
+        """Passes the given JSON-RPC session options to
+        Cs.set_jsonrpc_options().  See that method for documentation."""
+        self.cs.set_jsonrpc_options(probe_interval=probe_interval,
+                                    max_backoff=max_backoff)
+
     def index_create(self, table, name):
         """Create a named multi-column index on a table"""
         return self.tables[table].rows.index_create(name)

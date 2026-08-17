@@ -513,6 +513,29 @@ class Cs(object):
         self.data.last_id = str(uuid.UUID(int=0))
         self.force_reconnect()
 
+    def set_jsonrpc_options(self, probe_interval=None, max_backoff=None):
+        """Sets JSON-RPC session options for the CS layer's current session.
+
+        'probe_interval', if not None, is the maximum idle time in
+        milliseconds before an inactivity probe is sent (0 disables probing).
+        'max_backoff', if not None, is the maximum reconnection backoff in
+        milliseconds.
+
+        The C jsonrpc_session_options struct also carries a 'dscp' value, but
+        that only applies to passive connections; the python client session
+        has no live dscp control, so it is not exposed here."""
+        if self.session is None:
+            return
+        if max_backoff is not None:
+            self.session.reconnect.set_backoff(0, max_backoff)
+        if probe_interval is not None:
+            self.session.reconnect.set_probe_interval(probe_interval)
+
+    def set_probe_interval(self, probe_interval):
+        """Sets the "probe interval" for the current session to
+        'probe_interval', in milliseconds."""
+        self.set_jsonrpc_options(probe_interval=probe_interval)
+
     # The main pump.
 
     def run(self):
