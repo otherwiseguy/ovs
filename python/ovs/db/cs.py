@@ -49,6 +49,7 @@ import ovs.db.data as data
 import ovs.db.parser
 import ovs.db.schema
 import ovs.db.types
+import ovs.json
 import ovs.jsonrpc
 import ovs.ovsuuid
 import ovs.vlog
@@ -255,6 +256,13 @@ class ConditionState(object):
     @staticmethod
     def is_true(condition):
         return condition == [True]
+
+    def is_default(self):
+        """True if no condition change has ever been requested for this table,
+        i.e. the state is exactly as constructed.  The C code never creates a
+        condition entry for such tables, so clearing them must be a no-op."""
+        return (self._new_cond is None and self._req_cond is None
+                and self._ack_cond == [True])
 
     def init(self, cond):
         """Signal that a condition change is being initiated"""
@@ -954,6 +962,26 @@ class Cs(object):
     def get_condition_seqno(self):
         return self.data.cond_seqno
 
+    def clear_condition(self, table_name):
+        """Resets the condition state for 'table_name' back to its default, so
+        that on the next monitor request no condition is sent for the table.
+        Used when the server's schema lacks the table entirely.  Also forces a
+        full re-dump by clearing 'last_id'."""
+        table = self.data.tables.get(table_name)
+        if table is None:
+            return
+        if table.condition_state.is_default():
+            # The table never had a condition (C creates the entry lazily), so
+            # there is nothing to clear and 'last_id' must not be reset.
+            return
+        table.condition_state = ConditionState()
+        self.reset_last_id()
+
+    def reset_last_id(self):
+        """Clears 'last_id' so that the next monitor request fetches a full
+        database dump instead of resuming from a transaction id."""
+        self.data.last_id = str(uuid.UUID(int=0))
+
     # Database change awareness.
 
     def set_db_change_aware(self, db_change_aware):
@@ -1271,8 +1299,13 @@ class Cs(object):
                           'trying another server' % session_name)
                 return False
 
-        if self.state == self.S_SERVER_MONITOR_REQUESTED:
-            # Kick off the data monitor now that the server db is up to date.
+        if self.state == self.S_SERVER_MONITOR_REQUESTED and schema:
+            # Remember the server's schema for this database so that the IDL
+            # can filter its monitor requests against the tables and columns
+            # the server actually has.  'schema' is a single-element list
+            # holding the schema as a JSON string.  Kick off the data monitor.
+            parsed = ovs.json.from_string(schema[0])
+            self.data.schema = parsed if isinstance(parsed, dict) else None
             self._send_monitor_request(self.data, self.data.max_version)
             self.state = self.S_DATA_MONITOR_COND_SINCE_REQUESTED
 

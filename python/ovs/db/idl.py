@@ -144,6 +144,13 @@ class IdlTable(object):
         self.rows = custom_index.IndexedRows(self)
         self.idl = idl
         self.columns = {k: IdlColumn(v) for k, v in table.columns.items()}
+        # Set to True once the server's schema is known to contain this table.
+        self.in_server_schema = False
+        # The set of this table's column names that the server's schema has.
+        self.schema_columns = set()
+        # The last condition the client requested for this table, kept so it
+        # can be re-filtered against the server's schema on (re)connect.
+        self.req_cond = None
 
     def __getattr__(self, attr):
         return getattr(self._table, attr)
@@ -292,6 +299,11 @@ class Idl(object):
 
         self.change_seqno = 0
 
+        # Set to True once we have received the server's schema (via the first
+        # compose_monitor_requests() down-call).  Until then, conditions cannot
+        # be filtered against the server schema and are passed through as-is.
+        self.server_schema_received = False
+
         # Transaction support.
         self.txn = None
         self._outstanding_txns = {}
@@ -388,24 +400,104 @@ class Idl(object):
         update."""
         self.cs.close()
 
-    def compose_monitor_requests(self, server_schema=None):
+    def compose_monitor_requests(self, server_schema):
         """Down-call from the CS layer: returns the <monitor-requests> object
         describing the columns the IDL wants to replicate.  The CS layer layers
         the per-table conditions ("where" clauses) on top itself.
 
-        'server_schema' is the server's schema for this database, or None if it
-        is not known; it is unused here but present so the CS layer can call
-        this uniformly for every database."""
+        'server_schema' is the server's schema for this database as a parsed
+        JSON dict, or None if it is not yet known (e.g. an old server that does
+        not advertise it).  Tables and columns that the server's schema lacks
+        are filtered out of the monitor request; when 'server_schema' is None,
+        no filtering is done and every table and column is requested."""
+        self.server_schema_received = server_schema is not None
+
+        # Build a {table_name: set(column_names)} view of the server's schema.
+        server_tables = {}
+        if server_schema is not None:
+            for name, table_json in server_schema.get("tables", {}).items():
+                server_tables[name] = set(table_json.get("columns", {}).keys())
+
         monitor_requests = {}
         for table in self.tables.values():
+            server_columns = server_tables.get(table.name)
+            table.schema_columns = set()
             columns = []
             for column in table.columns.keys():
+                idl_has_column = (server_columns is not None
+                                  and column in server_columns)
+                if idl_has_column:
+                    table.schema_columns.add(column)
                 if ((table.name not in self.readonly) or
                         (table.name in self.readonly) and
                         (column not in self.readonly[table.name])):
+                    if server_columns is not None and not idl_has_column:
+                        vlog.warn("%s table in %s database lacks %s column "
+                                  "(database needs upgrade?)"
+                                  % (table.name, self._db.name, column))
+                        continue
                     columns.append(column)
+
+            if server_schema is not None:
+                if server_columns is None:
+                    vlog.warn("%s database lacks %s table (database needs "
+                              "upgrade?)" % (self._db.name, table.name))
+                    table.in_server_schema = False
+                    self.cs.clear_condition(table.name)
+                    continue
+                if not table.in_server_schema:
+                    # The server didn't have this table before and now it does.
+                    # Force a fresh dump rather than resuming from a last_id
+                    # whose transaction history does not cover this table, so
+                    # that our conditions cannot be out of sync.
+                    self.cs.reset_last_id()
+                table.in_server_schema = True
+
             monitor_requests[table.name] = [{"columns": columns}]
+
+            if server_schema is not None:
+                if not table.in_server_schema:
+                    self.cs.clear_condition(table.name)
+                elif table.req_cond is not None:
+                    # Re-filter the client's requested condition against the
+                    # (possibly changed) server schema.
+                    self._set_condition__(table.name, table.req_cond)
+
         return monitor_requests
+
+    def _server_has_column(self, table_name, column_name):
+        """Returns True if the server's schema has 'column_name' in
+        'table_name', as learned during the last compose_monitor_requests()."""
+        table = self.tables.get(table_name)
+        return (table is not None and table.in_server_schema
+                and column_name in table.schema_columns)
+
+    def _set_condition__(self, table_name, cond):
+        """Filters 'cond' against the server's schema (dropping clauses that
+        reference columns the server lacks, and refusing to set a condition on
+        a table the server lacks) and passes the result to the CS layer.
+        Returns the condition sequence number at which the change will have
+        taken effect."""
+        if not self.server_schema_received:
+            # Can't filter yet - pass through.  compose_monitor_requests() will
+            # re-apply the stored req_cond once the server schema is known.
+            return self.cs.set_condition(table_name, cond)
+
+        table = self.tables.get(table_name)
+        if table is None or not table.in_server_schema:
+            # Not on the server, should not set.
+            return self.cs.get_condition_seqno()
+
+        column_clauses = [c for c in cond if not isinstance(c, bool)]
+        if not column_clauses:
+            # Trivial condition ([True]/[False]/[]) and the table is present.
+            return self.cs.set_condition(table_name, cond)
+
+        # Non-trivial condition for a table that is in the server schema.
+        # Filter out clauses whose columns are not.
+        filtered = [c for c in column_clauses
+                    if self._server_has_column(table_name, c[0])]
+        return self.cs.set_condition(table_name, filtered)
 
     def run(self):
         """Processes a batch of messages from the database server.  Returns
@@ -459,7 +551,14 @@ class Idl(object):
         matches no rows (instead of matching every row).  That is, []
         is equivalent to [False], not to [True].
         """
-        return self.cs.set_condition(table_name, cond)
+        table = self.tables.get(table_name)
+        if table is None:
+            raise error.Error('Unknown table "%s"' % table_name)
+
+        # Remember the client's requested condition so it can be re-filtered
+        # against the server's schema on every (re)connect.
+        table.req_cond = list(cond)
+        return self._set_condition__(table_name, cond)
 
     def wait(self, poller):
         """Arranges for poller.block() to wake up when self.run() has something

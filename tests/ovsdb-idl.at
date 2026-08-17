@@ -1115,6 +1115,75 @@ AT_CHECK([grep '"monitor\|monitor_cond"' stderr | grep -c '"ua"'], [0], [1
 OVSDB_SERVER_SHUTDOWN
 AT_CLEANUP
 
+AT_SETUP([ovsdb-idl - handling of missing tables and columns - Python3])
+AT_KEYWORDS([ovsdb server idl positive Python3])
+
+# idltest2.ovsschema is the same as idltest.ovsschema, except that
+# table link2 and column l2 have been deleted.  But the IDL still
+# expects them to be there, so this test checks that the Python IDL
+# filters its monitor request against the server's schema and properly
+# tolerates the missing table and column.
+OVSDB_START_IDLTEST([], ["$abs_srcdir/idltest2.ovsschema"])
+AT_CHECK([$PYTHON3 $srcdir/test-ovsdb.py -t10 idl $srcdir/idltest.ovsschema unix:socket ['["idltest",
+      {"op": "insert",
+       "table": "link1",
+       "row": {"i": 0, "k": ["named-uuid", "self"]},
+       "uuid-name": "self"}]' \
+    '["idltest",
+      {"op": "insert",
+       "table": "link1",
+       "row": {"i": 1, "k": ["named-uuid", "row2"]},
+       "uuid-name": "row1"},
+      {"op": "insert",
+       "table": "link1",
+       "row": {"i": 2, "k": ["named-uuid", "row1"]},
+       "uuid-name": "row2"}]' \
+    '["idltest",
+      {"op": "update",
+       "table": "link1",
+       "where": [["i", "==", 1]],
+       "row": {"k": ["uuid", "#1#"]}}]' \
+    '["idltest",
+      {"op": "update",
+       "table": "link1",
+       "where": [],
+       "row": {"k": ["uuid", "#0#"]}}]']],
+         [0], [stdout], [stderr])
+AT_CHECK([sort stdout | uuidfilt], [0],
+    [[000: empty
+001: {"error":null,"result":[{"uuid":["uuid","<0>"]}]}
+002: table link1: i=0 k=0 ka=[] l2= uuid=<0>
+003: {"error":null,"result":[{"uuid":["uuid","<1>"]},{"uuid":["uuid","<2>"]}]}
+004: table link1: i=0 k=0 ka=[] l2= uuid=<0>
+004: table link1: i=1 k=2 ka=[] l2= uuid=<1>
+004: table link1: i=2 k=1 ka=[] l2= uuid=<2>
+005: {"error":null,"result":[{"count":1}]}
+006: table link1: i=0 k=0 ka=[] l2= uuid=<0>
+006: table link1: i=1 k=1 ka=[] l2= uuid=<1>
+006: table link1: i=2 k=1 ka=[] l2= uuid=<2>
+007: {"error":null,"result":[{"count":3}]}
+008: table link1: i=0 k=0 ka=[] l2= uuid=<0>
+008: table link1: i=1 k=0 ka=[] l2= uuid=<1>
+008: table link1: i=2 k=0 ka=[] l2= uuid=<2>
+009: done
+]])
+
+# Check that the Python ovsdb-idl figured out that table link2 and
+# column l2 (and the other tables absent from idltest2) are missing.
+AT_CHECK([grep 'database needs upgrade' stderr | sed 's/^.*| WARN | //' dnl
+          | sort -u],
+    [0], [dnl
+idltest database lacks indexed table (database needs upgrade?)
+idltest database lacks link2 table (database needs upgrade?)
+idltest database lacks simple5 table (database needs upgrade?)
+idltest database lacks simple6 table (database needs upgrade?)
+idltest database lacks singleton table (database needs upgrade?)
+link1 table in idltest database lacks l2 column (database needs upgrade?)
+simple7 table in idltest database lacks id column (database needs upgrade?)
+])
+OVSDB_SERVER_SHUTDOWN
+AT_CLEANUP
+
 m4_define([OVSDB_CHECK_IDL_FETCH_COLUMNS_PY],
   [AT_SETUP([ovsdb-idl - $1 - Python3 - fetch])
    AT_KEYWORDS([ovsdb server idl positive Python increment fetch $6])
