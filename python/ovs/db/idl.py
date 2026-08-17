@@ -17,8 +17,8 @@ import enum
 import functools
 import uuid
 
+import ovs.db.cs
 import ovs.db.data as data
-import ovs.db.parser
 import ovs.db.schema
 import ovs.jsonrpc
 import ovs.ovsuuid
@@ -143,7 +143,6 @@ class IdlTable(object):
         self.need_table = False
         self.rows = custom_index.IndexedRows(self)
         self.idl = idl
-        self._condition_state = ConditionState()
         self.columns = {k: IdlColumn(v) for k, v in table.columns.items()}
 
     def __getattr__(self, attr):
@@ -151,8 +150,8 @@ class IdlTable(object):
 
     @property
     def condition_state(self):
-        # read-only, no setter
-        return self._condition_state
+        # The condition state lives in the CS layer.  Read-only, no setter.
+        return self.idl.cs.data.tables[self.name].condition_state
 
     @property
     def condition(self):
@@ -281,63 +280,85 @@ class Idl(object):
         self.tables = IdlTable.schema_tables(self, schema)
         self.readonly = schema.readonly
         self._db = schema
-        remotes = self._parse_remotes(remote)
-        self._session = ovs.jsonrpc.Session.open_multiple(remotes,
-            probe_interval=probe_interval)
-        self._request_id = None
-        self._monitor_request_id = None
-        self._last_seqno = None
+
+        # The client-synchronization layer owns the jsonrpc session, the
+        # connection/monitor state machine, the _Server/cluster monitor,
+        # locking, and the condition engine.  The IDL registers itself as the
+        # CS layer's 'ops' so that CS can call back into
+        # compose_monitor_requests() to learn which columns to replicate.
+        self.cs = ovs.db.cs.Cs(remote, schema.name, list(self.tables.keys()),
+                               self, probe_interval=probe_interval,
+                               leader_only=leader_only)
+
         self.change_seqno = 0
-        self.uuid = uuid.uuid1()
-        self.last_id = str(uuid.UUID(int=0))
-
-        # Server monitor.
-        self._server_schema_request_id = None
-        self._server_monitor_request_id = None
-        self._db_change_aware_request_id = None
-        self._monitor_cancel_request_id = None
-        self._server_db_name = '_Server'
-        self._server_db_table = 'Database'
-        self.server_tables = None
-        self._server_db = None
-        self.server_monitor_uuid = uuid.uuid1()
-        self.leader_only = leader_only
-        self.cluster_id = None
-        self._min_index = 0
-
-        self.state = self.IDL_S_INITIAL
-
-        # Database locking.
-        self.lock_name = None          # Name of lock we need, None if none.
-        self.has_lock = False          # Has db server said we have the lock?
-        self.is_lock_contended = False  # Has db server said we can't get lock?
-        self._lock_request_id = None   # JSON-RPC ID of in-flight lock request.
 
         # Transaction support.
         self.txn = None
         self._outstanding_txns = {}
 
-        self.cond_changed = False
-        self.cond_seqno = 0
+    # --- Thin delegations to the CS layer (preserve the public interface) ---
 
-    def _parse_remotes(self, remote):
-        # If remote is -
-        # "tcp:10.0.0.1:6641,unix:/tmp/db.sock,t,s,tcp:10.0.0.2:6642"
-        # this function returns
-        # ["tcp:10.0.0.1:6641", "unix:/tmp/db.sock,t,s", tcp:10.0.0.2:6642"]
-        remotes = []
-        for r in remote.split(','):
-            if remotes and r.find(":") == -1:
-                remotes[-1] += "," + r
-            else:
-                remotes.append(r)
-        return remotes
+    @property
+    def _session(self):
+        return self.cs.session
+
+    @property
+    def state(self):
+        return self.cs.state
+
+    @property
+    def lock_name(self):
+        return self.cs.get_lock()
+
+    @property
+    def has_lock(self):
+        return self.cs.has_lock()
+
+    @property
+    def is_lock_contended(self):
+        return self.cs.is_lock_contended()
+
+    @property
+    def cond_seqno(self):
+        return self.cs.get_condition_seqno()
+
+    @property
+    def cluster_id(self):
+        return self.cs.cluster_id
 
     def set_cluster_id(self, cluster_id):
         """Set the id of the cluster that this idl must connect to."""
-        self.cluster_id = cluster_id
-        if self.state != self.IDL_S_INITIAL:
-            self.force_reconnect()
+        self.cs.set_cluster_id(cluster_id)
+
+    def set_remote(self, remote, retry=True):
+        """Makes the IDL reconnect to 'remote' in place of its current target,
+        or disconnect entirely if 'remote' is None.  If 'retry' is false, the
+        IDL makes a single pass through the remotes and then gives up."""
+        self.cs.set_remote(remote, retry)
+
+    def set_shuffle_remotes(self, shuffle):
+        """Set whether the IDL shuffles the order of the remotes each time it
+        (re)connects, for load balancing."""
+        self.cs.set_shuffle_remotes(shuffle)
+
+    def enable_reconnect(self):
+        """Re-enables reconnection to the database after it was disabled by a
+        set_remote() call with retry=False."""
+        self.cs.enable_reconnect()
+
+    def set_leader_only(self, leader_only):
+        """Set whether this idl must connect to the cluster leader."""
+        self.cs.set_leader_only(leader_only)
+
+    def reset_min_index(self):
+        """Resets the minimum index that the IDL will accept from the database,
+        allowing a new server with a lower index to be used."""
+        self.cs.reset_min_index()
+
+    def flag_inconsistency(self):
+        """Tells the IDL that the client detected an inconsistency in the
+        database, so it must reconnect and re-download the whole database."""
+        self.cs.flag_inconsistency()
 
     def index_create(self, table, name):
         """Create a named multi-column index on a table"""
@@ -354,66 +375,26 @@ class Idl(object):
     def close(self):
         """Closes the connection to the database.  The IDL will no longer
         update."""
-        self._session.close()
+        self.cs.close()
 
-    def ack_conditions(self):
-        """Mark all requested table conditions as acked"""
+    def compose_monitor_requests(self, server_schema=None):
+        """Down-call from the CS layer: returns the <monitor-requests> object
+        describing the columns the IDL wants to replicate.  The CS layer layers
+        the per-table conditions ("where" clauses) on top itself.
+
+        'server_schema' is the server's schema for this database, or None if it
+        is not known; it is unused here but present so the CS layer can call
+        this uniformly for every database."""
+        monitor_requests = {}
         for table in self.tables.values():
-            table.condition_state.ack()
-
-    def sync_conditions(self):
-        """Synchronize condition state when the FSM is restarted
-
-        If a non-zero 'last_id' is available for the DB, then upon reconnect
-        the IDL should first request acked conditions to avoid missing updates
-        about records that were added before the transaction with
-        txn-id == last_id.
-
-        If there were changes in flight then there are two cases:
-        a. either the server already processed the requested monitor condition
-           change but the FSM was restarted before the client was notified.
-           In this case the client should clear its local cache because it's
-           out of sync with the monitor view on the server side.
-
-        b. OR the server hasn't processed the requested monitor condition
-           change yet.
-
-        As there's no easy way to differentiate between the two, and given that
-        this condition should be rare, reset the 'last_id', essentially
-        flushing the local cached DB contents.
-
-        If there's no 'last_id' available for the DB or it was reset, then
-        it's safe to use the latest conditions set by the client even if they
-        weren't acked yet, since the local cache will be cleared anyway.
-        """
-        for table in self.tables.values():
-            if table.condition_state.requested is not None:
-                # There was an in-flight condition change - reset.
-                self.last_id = str(uuid.UUID(int=0))
-                break
-
-        if self.last_id == str(uuid.UUID(int=0)):
-            # No 'last_id' - use the latest conditions for the monitor request.
-            for table in self.tables.values():
-                table.condition_state.request()
-                table.condition_state.ack()
-            # Nothing to send after the initial monitor request.
-            self.cond_changed = False
-        else:
-            # No in-flight changes and a non-zero 'last_id'.  Send acknowledged
-            # first, then follow up with the new, if any.
-            for table in self.tables.values():
-                if table.condition_state.new is not None:
-                    self.cond_changed = True
-                    break
-
-    def restart_fsm(self):
-        # Resync data DB table conditions to avoid missing updated due to
-        # conditions that were in flight or changed locally while the
-        # connection was down.
-        self.sync_conditions()
-        self.__send_server_schema_request()
-        self.state = self.IDL_S_SERVER_SCHEMA_REQUESTED
+            columns = []
+            for column in table.columns.keys():
+                if ((table.name not in self.readonly) or
+                        (table.name in self.readonly) and
+                        (column not in self.readonly[table.name])):
+                    columns.append(column)
+            monitor_requests[table.name] = [{"columns": columns}]
+        return monitor_requests
 
     def run(self):
         """Processes a batch of messages from the database server.  Returns
@@ -436,254 +417,29 @@ class Idl(object):
         assert not self.txn
         initial_change_seqno = self.change_seqno
 
-        self.send_cond_change()
-        self._session.run()
-        i = 0
-        while i < 50:
-            i += 1
-            previous_change_seqno = self.change_seqno
-            if not self._session.is_connected():
-                break
-
-            seqno = self._session.get_seqno()
-            if seqno != self._last_seqno:
-                self._last_seqno = seqno
+        for event in self.cs.run():
+            if isinstance(event, ovs.db.cs.ReconnectEvent):
                 self.__txn_abort_all()
-                self.restart_fsm()
-                if self.lock_name:
-                    self.__send_lock_request()
-                break
-
-            msg = self._session.recv()
-            if msg is None:
-                break
-            is_response = msg.type in (ovs.jsonrpc.Message.T_REPLY,
-                                       ovs.jsonrpc.Message.T_ERROR)
-
-            if is_response and self._request_id and self._request_id == msg.id:
-                self._request_id = None
-                # process_response follows
-
-            if (msg.type == ovs.jsonrpc.Message.T_NOTIFY
-                    and msg.method == "update3"
-                    and len(msg.params) == 3):
-                # Database contents changed.
-                self.__parse_update(msg.params[2], OVSDB_UPDATE3)
-                self.last_id = msg.params[1]
-            elif (msg.type == ovs.jsonrpc.Message.T_NOTIFY
-                    and msg.method in (OVSDB_UPDATE, OVSDB_UPDATE2)
-                    and len(msg.params) == 2):
-                # Database contents changed.
-                if msg.params[0] == str(self.server_monitor_uuid):
-                    self.__parse_update(msg.params[1], msg.method,
-                                        tables=self.server_tables)
-                    self.change_seqno = previous_change_seqno
-                    if not self.__check_server_db():
-                        self.force_reconnect()
-                        break
-                else:
-                    self.__parse_update(msg.params[1], msg.method)
-            elif self.handle_monitor_canceled(msg):
-                break
-            elif self.handle_monitor_cancel_reply(msg):
-                break
-            elif (msg.type == ovs.jsonrpc.Message.T_REPLY
-                  and self._monitor_request_id is not None
-                  and self._monitor_request_id == msg.id):
-                # Reply to our "monitor" request.
-                try:
+            elif isinstance(event, ovs.db.cs.LockedEvent):
+                # If the client couldn't run a transaction because it didn't
+                # have the lock, this will encourage it to try again.  But if
+                # we're still setting up the session, don't signal that the
+                # database changed; finalizing the session (the monitor reply)
+                # will increment change_seqno anyhow.
+                if self.cs.may_send_transaction():
                     self.change_seqno += 1
-                    self._monitor_request_id = None
-                    if (self.state ==
-                            self.IDL_S_DATA_MONITOR_COND_SINCE_REQUESTED):
-                        # If 'found' is false, clear table rows for new dump
-                        if not msg.result[0]:
-                            self.__clear()
-                        self.__parse_update(msg.result[2], OVSDB_UPDATE3)
-                        self.last_id = msg.result[1]
-                    elif self.state == self.IDL_S_DATA_MONITOR_COND_REQUESTED:
-                        self.__clear()
-                        self.__parse_update(msg.result, OVSDB_UPDATE2)
-                    else:
-                        assert self.state == self.IDL_S_DATA_MONITOR_REQUESTED
-                        self.__clear()
-                        self.__parse_update(msg.result, OVSDB_UPDATE)
-                    self.state = self.IDL_S_MONITORING
-
-                except error.Error as e:
-                    vlog.err("%s: parse error in received schema: %s"
-                             % (self._session.get_name(), e))
-                    self.__error()
-            elif (msg.type == ovs.jsonrpc.Message.T_REPLY
-                  and self._server_schema_request_id is not None
-                  and self._server_schema_request_id == msg.id):
-                # Reply to our "get_schema" of _Server request.
-                try:
-                    self._server_schema_request_id = None
-                    sh = SchemaHelper(None, msg.result)
-                    sh.register_table(self._server_db_table)
-                    schema = sh.get_idl_schema()
-                    self._server_db = schema
-                    self.server_tables = IdlTable.schema_tables(self, schema)
-                    self.__send_server_monitor_request()
-                except error.Error as e:
-                    vlog.err("%s: error receiving server schema: %s"
-                             % (self._session.get_name(), e))
-                    if self.cluster_id:
-                        self.__error()
-                        break
-                    else:
-                        self.change_seqno = previous_change_seqno
-                        self.__send_monitor_request()
-            elif (msg.type == ovs.jsonrpc.Message.T_REPLY
-                  and self._server_monitor_request_id is not None
-                  and self._server_monitor_request_id == msg.id):
-                # Reply to our "monitor" of _Server request.
-                try:
-                    self._server_monitor_request_id = None
-                    self.__parse_update(msg.result, OVSDB_UPDATE2,
-                                        tables=self.server_tables)
-                    self.change_seqno = previous_change_seqno
-                    if self.__check_server_db():
-                        self.__send_monitor_request()
-                        self.__send_db_change_aware()
-                    else:
-                        self.force_reconnect()
-                        break
-                except error.Error as e:
-                    vlog.err("%s: parse error in received schema: %s"
-                             % (self._session.get_name(), e))
-                    if self.cluster_id:
-                        self.__error()
-                        break
-                    else:
-                        self.change_seqno = previous_change_seqno
-                        self.__send_monitor_request()
-            elif (msg.type == ovs.jsonrpc.Message.T_REPLY
-                  and self._db_change_aware_request_id is not None
-                  and self._db_change_aware_request_id == msg.id):
-                # Reply to us notifying the server of our change awarness.
-                self._db_change_aware_request_id = None
-            elif (msg.type == ovs.jsonrpc.Message.T_REPLY
-                  and self._lock_request_id is not None
-                  and self._lock_request_id == msg.id):
-                # Reply to our "lock" request.
-                self.__parse_lock_reply(msg.result)
-            elif (msg.type == ovs.jsonrpc.Message.T_NOTIFY
-                  and msg.method == "locked"):
-                # We got our lock.
-                self.__parse_lock_notify(msg.params, True)
-            elif (msg.type == ovs.jsonrpc.Message.T_NOTIFY
-                  and msg.method == "stolen"):
-                # Someone else stole our lock.
-                self.__parse_lock_notify(msg.params, False)
-            elif msg.type == ovs.jsonrpc.Message.T_NOTIFY and msg.id == "echo":
-                # Reply to our echo request.  Ignore it.
-                pass
-            elif (msg.type == ovs.jsonrpc.Message.T_ERROR and
-                  self.state == self.IDL_S_SERVER_MONITOR_REQUESTED and
-                  msg.id == self._server_monitor_request_id):
-                self._server_monitor_request_id = None
-                self.__send_monitor_request()
-            elif (msg.type == ovs.jsonrpc.Message.T_ERROR and
-                  self.state == (
-                      self.IDL_S_DATA_MONITOR_COND_SINCE_REQUESTED) and
-                      self._monitor_request_id == msg.id):
-                if msg.error == "unknown method":
-                    self.__send_monitor_request(Monitor.monitor_cond)
-            elif (msg.type == ovs.jsonrpc.Message.T_ERROR and
-                  self.state == self.IDL_S_DATA_MONITOR_COND_REQUESTED and
-                  self._monitor_request_id == msg.id):
-                if msg.error == "unknown method":
-                    self.__send_monitor_request(Monitor.monitor)
-            elif (msg.type == ovs.jsonrpc.Message.T_ERROR and
-                  self._server_schema_request_id is not None and
-                  self._server_schema_request_id == msg.id):
-                self._server_schema_request_id = None
-                if self.cluster_id:
-                    self.force_reconnect()
-                    break
-                else:
-                    self.change_seqno = previous_change_seqno
-                    self.__send_monitor_request()
-            elif (msg.type in (ovs.jsonrpc.Message.T_ERROR,
-                               ovs.jsonrpc.Message.T_REPLY)
-                  and self.__txn_process_reply(msg)):
-                # __txn_process_reply() did everything needed.
-                pass
-            elif (msg.type == ovs.jsonrpc.Message.T_REPLY and
-                  self.state == self.IDL_S_MONITORING):
-                # Mark the last requested conditions as acked and if further
-                # condition changes were pending, send them now.
-                self.ack_conditions()
-                self.send_cond_change()
-                self.cond_seqno += 1
-            else:
-                # This can happen if a transaction is destroyed before we
-                # receive the reply, so keep the log level low.
-                vlog.dbg("%s: received unexpected %s message"
-                         % (self._session.get_name(),
-                             ovs.jsonrpc.Message.type_to_string(msg.type)))
+            elif isinstance(event, ovs.db.cs.UpdateEvent):
+                if event.monitor_reply:
+                    # Even if the data is unchanged, a monitor reply signals a
+                    # (re)connection, which is considered a change.
+                    self.change_seqno += 1
+                if event.clear:
+                    self._clear()
+                self.__parse_update(event.table_updates, event.version)
+            elif isinstance(event, ovs.db.cs.TxnReplyEvent):
+                self.__txn_process_reply(event.msg)
 
         return initial_change_seqno != self.change_seqno
-
-    def handle_monitor_canceled(self, msg):
-        if msg.type != msg.T_NOTIFY:
-            return False
-        if msg.method != "monitor_canceled":
-            return False
-
-        if msg.params[0] == str(self.uuid):
-            params = [str(self.server_monitor_uuid)]
-        elif msg.params[0] == str(self.server_monitor_uuid):
-            params = [str(self.uuid)]
-        else:
-            return False
-
-        mc_msg = ovs.jsonrpc.Message.create_request("monitor_cancel", params)
-        self._monitor_cancel_request_id = mc_msg.id
-        self.send_request(mc_msg)
-        self.restart_fsm()
-        return True
-
-    def handle_monitor_cancel_reply(self, msg):
-        if msg.type != msg.T_REPLY:
-            return False
-        if msg.id != self._monitor_cancel_request_id:
-            return False
-        self._monitor_cancel_request_id = None
-        return True
-
-    def compose_cond_change(self):
-        if not self.cond_changed:
-            return
-
-        change_requests = {}
-        for table in self.tables.values():
-            # Always use the most recent conditions set by the IDL client when
-            # requesting monitor_cond_change
-            if table.condition_state.new is not None:
-                change_requests[table.name] = [
-                    {"where": table.condition_state.new}]
-                table.condition_state.request()
-
-        if not change_requests:
-            return
-
-        self.cond_changed = False
-        old_uuid = str(self.uuid)
-        self.uuid = uuid.uuid1()
-        params = [old_uuid, str(self.uuid), change_requests]
-        return ovs.jsonrpc.Message.create_request(
-            "monitor_cond_change", params)
-
-    def send_cond_change(self):
-        if not self._session.is_connected() or self._request_id is not None:
-            return
-
-        msg = self.compose_cond_change()
-        if msg:
-            self.send_request(msg)
 
     def cond_change(self, table_name, cond):
         """Sets the condition for 'table_name' to 'cond', which should be a
@@ -692,38 +448,12 @@ class Idl(object):
         matches no rows (instead of matching every row).  That is, []
         is equivalent to [False], not to [True].
         """
-
-        table = self.tables.get(table_name)
-        if not table:
-            raise error.Error('Unknown table "%s"' % table_name)
-
-        if cond == []:
-            cond = [False]
-
-        # Compare the new condition to the last known condition
-        if table.condition_state.latest != cond:
-            table.condition_state.init(cond)
-            self.cond_changed = True
-
-        # New condition will be sent out after all already requested ones
-        # are acked.
-        if table.condition_state.new:
-            any_reqs = any(t.condition_state.request
-                           for t in self.tables.values())
-            return self.cond_seqno + int(any_reqs) + 1
-
-        # Already requested conditions should be up to date at
-        # self.cond_seqno + 1 while acked conditions are already up to date
-        return self.cond_seqno + int(bool(table.condition_state.requested))
+        return self.cs.set_condition(table_name, cond)
 
     def wait(self, poller):
         """Arranges for poller.block() to wake up when self.run() has something
         to do or when activity occurs on a transaction on 'self'."""
-        if self.cond_changed:
-            poller.immediate_wake()
-            return
-        self._session.wait(poller)
-        self._session.recv_wait(poller)
+        self.cs.wait(poller)
 
     def has_ever_connected(self):
         """Returns True, if the IDL successfully connected to the remote
@@ -739,29 +469,10 @@ class Idl(object):
     def force_reconnect(self):
         """Forces the IDL to drop its connection to the database and reconnect.
         In the meantime, the contents of the IDL will not change."""
-        if self.state == self.IDL_S_MONITORING:
-            # The IDL was in MONITORING state, so we either had data
-            # inconsistency on this server, or it stopped being the cluster
-            # leader, or the user requested to re-connect.  Avoiding backoff
-            # in these cases, as we need to re-connect as soon as possible.
-            # Connections that are not in MONITORING state should have their
-            # backoff to avoid constant flood of re-connection attempts in
-            # case there is no suitable database server.
-            self._session.reset_backoff()
-        self._session.force_reconnect()
-
-    def flag_inconsistency(self):
-        """Tells the IDL that the client detected an inconsistency in the
-        database, so it must reconnect and re-download the whole database.
-
-        The 'last_id' is reset so that the IDL cannot request a fast resync
-        (monitor_cond_since) against the same server; instead the whole
-        database is re-downloaded, potentially from a different server."""
-        self.last_id = str(uuid.UUID(int=0))
-        self.force_reconnect()
+        self.cs.force_reconnect()
 
     def session_name(self):
-        return self._session.get_name()
+        return self.cs.session_name()
 
     def set_lock(self, lock_name):
         """If 'lock_name' is not None, configures the IDL to obtain the named
@@ -773,17 +484,7 @@ class Idl(object):
         lock."""
         assert not self.txn
         assert not self._outstanding_txns
-
-        if self.lock_name and (not lock_name or lock_name != self.lock_name):
-            # Release previous lock.
-            self.__send_unlock_request()
-            self.lock_name = None
-            self.is_lock_contended = False
-
-        if lock_name and not self.lock_name:
-            # Acquire new lock.
-            self.lock_name = lock_name
-            self.__send_lock_request()
+        self.cs.set_lock(lock_name)
 
     def notify(self, event, row, updates=None):
         """Hook for implementing create/update/delete notifications
@@ -806,191 +507,36 @@ class Idl(object):
         to doing nothing to avoid overhead where it is not needed.
         """
 
-    def __clear(self):
-        changed = False
-
+    def _clear(self):
         for table in self.tables.values():
-            if table.rows:
-                changed = True
-                table.rows.clear()
+            table.rows.clear()
 
-        self.cond_seqno = 0
+        self.change_seqno += 1
 
-        if changed:
-            self.change_seqno += 1
-
-    def __update_has_lock(self, new_has_lock):
-        if new_has_lock and not self.has_lock:
-            if self._monitor_request_id is None:
-                self.change_seqno += 1
-            else:
-                # We're waiting for a monitor reply, so don't signal that the
-                # database changed.  The monitor reply will increment
-                # change_seqno anyhow.
-                pass
-            self.is_lock_contended = False
-        self.has_lock = new_has_lock
-
-    def __do_send_lock_request(self, method):
-        self.__update_has_lock(False)
-        self._lock_request_id = None
-        if self._session.is_connected():
-            msg = ovs.jsonrpc.Message.create_request(method, [self.lock_name])
-            msg_id = msg.id
-            self._session.send(msg)
-        else:
-            msg_id = None
-        return msg_id
-
-    def __send_lock_request(self):
-        self._lock_request_id = self.__do_send_lock_request("lock")
-
-    def __send_unlock_request(self):
-        self.__do_send_lock_request("unlock")
-
-    def __parse_lock_reply(self, result):
-        self._lock_request_id = None
-        got_lock = isinstance(result, dict) and result.get("locked") is True
-        self.__update_has_lock(got_lock)
-        if not got_lock:
-            self.is_lock_contended = True
-
-    def __parse_lock_notify(self, params, new_has_lock):
-        if (self.lock_name is not None
-            and isinstance(params, (list, tuple))
-            and params
-            and params[0] == self.lock_name):
-            self.__update_has_lock(new_has_lock)
-            if not new_has_lock:
-                self.is_lock_contended = True
-
-    def __send_db_change_aware(self):
-        msg = ovs.jsonrpc.Message.create_request("set_db_change_aware",
-                                                 [True])
-        self._db_change_aware_request_id = msg.id
-        self._session.send(msg)
-
-    def send_request(self, request):
-        self._request_id = request.id
-        if self._session.is_connected():
-            return self._session.send(request)
-
-    def __send_monitor_request(self, max_version=Monitor.monitor_cond_since):
-        if self.state == self.IDL_S_INITIAL:
-            self.state = self.IDL_S_DATA_MONITOR_COND_REQUESTED
-            method = "monitor_cond"
-        elif self.state == self.IDL_S_SERVER_MONITOR_REQUESTED:
-            self.state = self.monitor_map[Monitor(max_version)]
-            method = Monitor(max_version).name
-        else:
-            self.state = self.IDL_S_DATA_MONITOR_REQUESTED
-            method = "monitor"
-
-        monitor_requests = {}
-        for table in self.tables.values():
-            columns = []
-            for column in table.columns.keys():
-                if ((table.name not in self.readonly) or
-                        (table.name in self.readonly) and
-                        (column not in self.readonly[table.name])):
-                    columns.append(column)
-            monitor_request = {"columns": columns}
-            if method in ("monitor_cond", "monitor_cond_since") and (
-                    not ConditionState.is_true(table.condition_state.acked)):
-                monitor_request["where"] = table.condition_state.acked
-            monitor_requests[table.name] = [monitor_request]
-
-        args = [self._db.name, str(self.uuid), monitor_requests]
-        if method == "monitor_cond_since":
-            args.append(str(self.last_id))
-        msg = ovs.jsonrpc.Message.create_request(method, args)
-        self._monitor_request_id = msg.id
-        self.send_request(msg)
-
-    def __send_server_schema_request(self):
-        self.state = self.IDL_S_SERVER_SCHEMA_REQUESTED
-        msg = ovs.jsonrpc.Message.create_request(
-            "get_schema", [self._server_db_name, str(self.uuid)])
-        self._server_schema_request_id = msg.id
-        self.send_request(msg)
-
-    def __send_server_monitor_request(self):
-        self.state = self.IDL_S_SERVER_MONITOR_REQUESTED
-        monitor_requests = {}
-        table = self.server_tables[self._server_db_table]
-        columns = [column for column in table.columns.keys()]
-        for column in table.columns.values():
-            if not hasattr(column, 'alert'):
-                column.alert = True
-        table.rows = custom_index.IndexedRows(table)
-        table.need_table = False
-        table.idl = self
-        monitor_request = {"columns": columns}
-        monitor_requests[table.name] = [monitor_request]
-        msg = ovs.jsonrpc.Message.create_request(
-            'monitor_cond', [self._server_db.name,
-                             str(self.server_monitor_uuid),
-                             monitor_requests])
-        self._server_monitor_request_id = msg.id
-        self.send_request(msg)
-
-    def __parse_update(self, update, version, tables=None):
+    def __parse_update(self, update, version):
         try:
-            if not tables:
-                self._do_parse_update(update, version, self.tables)
-            else:
-                self._do_parse_update(update, version, tables)
+            self._do_parse_update(update, version, self.tables)
         except error.Error as e:
             vlog.err("%s: error parsing update: %s"
-                     % (self._session.get_name(), e))
+                     % (self.session_name(), e))
 
     def _do_parse_update(self, table_updates, version, tables):
-        if not isinstance(table_updates, dict):
-            raise error.Error("<table-updates> is not an object",
-                              table_updates)
+        # The wire-format parsing (envelope, UUID validation, and the version
+        # 1 vs. version 2/3 row-update demux) is shared with the _Server
+        # replica in ovs.db.cs, mirroring the C code where both databases go
+        # through ovsdb_cs_parse_db_update().
+        db_update = ovs.db.cs.parse_db_update(table_updates, version)
 
         notices = []
-        for table_name, table_update in table_updates.items():
+        for table_name, row_updates in db_update.items():
             table = tables.get(table_name)
             if not table:
                 raise error.Error('<table-updates> includes unknown '
                                   'table "%s"' % table_name)
 
-            if not isinstance(table_update, dict):
-                raise error.Error('<table-update> for table "%s" is not '
-                                  'an object' % table_name, table_update)
-
-            for uuid_string, row_update in table_update.items():
-                if not ovs.ovsuuid.is_valid_string(uuid_string):
-                    raise error.Error('<table-update> for table "%s" '
-                                      'contains bad UUID "%s" as member '
-                                      'name' % (table_name, uuid_string),
-                                      table_update)
-                uuid = ovs.ovsuuid.from_string(uuid_string)
-
-                if not isinstance(row_update, dict):
-                    raise error.Error('<table-update> for table "%s" '
-                                      'contains <row-update> for %s that '
-                                      'is not an object'
-                                      % (table_name, uuid_string))
-
+            for ru in row_updates:
                 self.cooperative_yield()
-
-                if version in (OVSDB_UPDATE2, OVSDB_UPDATE3):
-                    result, notice = self._process_update2(table, uuid,
-                                                           row_update)
-                else:
-                    parser = ovs.db.parser.Parser(row_update, "row-update")
-                    old = parser.get_optional("old", [dict])
-                    new = parser.get_optional("new", [dict])
-                    parser.finish()
-
-                    if not old and not new:
-                        raise error.Error('<row-update> missing "old" and '
-                                          '"new" members', row_update)
-
-                    result, notice = self._process_update(table, uuid,
-                                                          old, new)
+                result, notice = self._process_row_update(table, ru)
 
                 if result == OVSDB_IDL_UPDATE_INCONSISTENT:
                     # The IDL ended up in an inconsistent state, e.g. because
@@ -1002,15 +548,15 @@ class Idl(object):
                                       "IDL: reconnecting IDL and resync all "
                                       "data")
 
-                if (result == OVSDB_IDL_UPDATE_DB_CHANGED
-                        and tables is not self.server_tables):
+                if result == OVSDB_IDL_UPDATE_DB_CHANGED:
                     notices.append(notice)
                     self.change_seqno += 1
         for notice in notices:
             self.notify(*notice)
 
-    def _process_update2(self, table, uuid, row_update):
-        """Returns a tuple (result, notice).
+    def _process_row_update(self, table, ru):
+        """Applies a single parsed ovs.db.cs.RowUpdate 'ru' to 'table'.
+        Returns a tuple (result, notice), mirroring ovsdb_idl_process_update().
 
         'result' is one of OVSDB_IDL_UPDATE_DB_CHANGED,
         OVSDB_IDL_UPDATE_NO_CHANGES or OVSDB_IDL_UPDATE_INCONSISTENT, and
@@ -1025,181 +571,54 @@ class Idl(object):
         the client could recover, it's best to report the inconsistent state
         because the state the server is in is unknown, so the safest thing to
         do is to retry (potentially connecting to a new server)."""
+        uuid = ru.uuid
         row = table.rows.get(uuid)
-        if "delete" in row_update:
+
+        if ru.type == ovs.db.cs.ROW_UPDATE_DELETE:
             if row:
                 del table.rows[uuid]
                 return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_DELETE, row)
-            else:
-                # XXX rate-limit
-                vlog.err("cannot delete missing row %s from table %s"
-                         % (uuid, table.name))
-                return OVSDB_IDL_UPDATE_INCONSISTENT, None
-        elif "insert" in row_update or "initial" in row_update:
+            # XXX rate-limit
+            vlog.err("cannot delete missing row %s from table %s"
+                     % (uuid, table.name))
+            return OVSDB_IDL_UPDATE_INCONSISTENT, None
+
+        if ru.type == ovs.db.cs.ROW_UPDATE_INSERT:
             if row:
                 # XXX rate-limit
                 vlog.err("cannot add existing row %s to table %s"
                          % (uuid, table.name))
                 return OVSDB_IDL_UPDATE_INCONSISTENT, None
             row = self.__create_row(table, uuid)
-            if "insert" in row_update:
-                row_update = row_update['insert']
-            else:
-                row_update = row_update['initial']
-            self.__add_default(table, row_update)
-            changed = self.__row_update(table, row, row_update)
+            self.__add_default(table, ru.columns)
+            changed = self.__row_update(table, row, ru.columns)
             table.rows[uuid] = row
             if changed:
                 return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_CREATE, row)
             return OVSDB_IDL_UPDATE_NO_CHANGES, None
-        elif "modify" in row_update:
-            if not row:
-                # XXX rate-limit
-                vlog.err("cannot modify missing row %s in table %s"
-                         % (uuid, table.name))
-                return OVSDB_IDL_UPDATE_INCONSISTENT, None
 
-            del table.rows[uuid]
-            old_row, changed = self._apply_diff(table, row,
-                                                row_update['modify'])
-            table.rows[uuid] = row
-            if changed:
-                return (OVSDB_IDL_UPDATE_DB_CHANGED,
-                        Notice(ROW_UPDATE, row, Row(self, table, uuid,
-                                                    old_row)))
-            return OVSDB_IDL_UPDATE_NO_CHANGES, None
-        else:
+        # ROW_UPDATE_UPDATE (a version 1 "new" <row> with the new values of the
+        # changed columns) or ROW_UPDATE_XOR (a version 2/3 "modify" diff).
+        # Both modify an existing row.
+        if not row:
             # XXX rate-limit
-            vlog.err("unknown operation in <row-update> for table %s"
-                     % table.name)
-            return OVSDB_IDL_UPDATE_NO_CHANGES, None
+            vlog.err("cannot modify missing row %s in table %s"
+                     % (uuid, table.name))
+            return OVSDB_IDL_UPDATE_INCONSISTENT, None
 
-    def _process_update(self, table, uuid, old, new):
-        """Returns a tuple (result, notice).
-
-        'result' is one of OVSDB_IDL_UPDATE_DB_CHANGED,
-        OVSDB_IDL_UPDATE_NO_CHANGES or OVSDB_IDL_UPDATE_INCONSISTENT, and
-        'notice' is a Notice describing the change or None.
-
-        Some IDL inconsistencies can be detected when processing updates:
-        - trying to insert an already existing row
-        - trying to update a missing row
-        - trying to delete a non existent row
-
-        In such cases OVSDB_IDL_UPDATE_INCONSISTENT is returned.  Even though
-        the client could recover, it's best to report the inconsistent state
-        because the state the server is in is unknown, so the safest thing to
-        do is to retry (potentially connecting to a new server)."""
-        row = table.rows.get(uuid)
-        changed = False
-        if not new:
-            # Delete row.
-            if row:
-                del table.rows[uuid]
-                return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_DELETE, row)
-            else:
-                # XXX rate-limit
-                vlog.err("cannot delete missing row %s from table %s"
-                         % (uuid, table.name))
-                return OVSDB_IDL_UPDATE_INCONSISTENT, None
-        elif not old:
-            # Insert row.
-            if not row:
-                row = self.__create_row(table, uuid)
-                changed = True
-            else:
-                # XXX rate-limit
-                vlog.err("cannot add existing row %s to table %s"
-                         % (uuid, table.name))
-                return OVSDB_IDL_UPDATE_INCONSISTENT, None
-
-            changed |= self.__row_update(table, row, new)
-            table.rows[uuid] = row
-            if changed:
-                return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_CREATE, row)
-            return OVSDB_IDL_UPDATE_NO_CHANGES, None
+        del table.rows[uuid]
+        if ru.type == ovs.db.cs.ROW_UPDATE_XOR:
+            old_row, changed = self._apply_diff(table, row, ru.columns)
         else:
-            # Modify row.
-            if not row:
-                # XXX rate-limit
-                vlog.err("cannot modify missing row %s in table %s"
-                         % (uuid, table.name))
-                return OVSDB_IDL_UPDATE_INCONSISTENT, None
-
-            del table.rows[uuid]
-            changed |= self.__row_update(table, row, new)
-            table.rows[uuid] = row
-            if changed:
-                return (OVSDB_IDL_UPDATE_DB_CHANGED,
-                        Notice(ROW_UPDATE, row,
-                               Row.from_json(self, table, uuid, old)))
-            return OVSDB_IDL_UPDATE_NO_CHANGES, None
-
-    def __check_server_db(self):
-        """Returns True if this is a valid server database, False otherwise."""
-        session_name = self.session_name()
-
-        if self._server_db_table not in self.server_tables:
-            vlog.info("%s: server does not have %s table in its %s database"
-                      % (session_name, self._server_db_table,
-                         self._server_db_name))
-            return False
-
-        rows = self.server_tables[self._server_db_table].rows
-
-        database = None
-        for row in rows.values():
-            if self.cluster_id:
-                if self.cluster_id in \
-                   map(lambda x: str(x)[:4], row.cid):
-                    database = row
-                    break
-            elif row.name == self._db.name:
-                database = row
-                break
-
-        if not database:
-            vlog.info("%s: server does not have %s database"
-                      % (session_name, self._db.name))
-            return False
-
-        if database.model == CLUSTERED:
-            if not database.schema:
-                vlog.info('%s: clustered database server has not yet joined '
-                          'cluster; trying another server' % session_name)
-                return False
-            if not database.connected:
-                vlog.info('%s: clustered database server is disconnected '
-                          'from cluster; trying another server' % session_name)
-                return False
-            if (self.leader_only and
-                not database.leader):
-                vlog.info('%s: clustered database server is not cluster '
-                          'leader; trying another server' % session_name)
-                return False
-            if database.index:
-                if database.index[0] < self._min_index:
-                    vlog.warn('%s: clustered database server has stale data; '
-                              'trying another server' % session_name)
-                    return False
-                self._min_index = database.index[0]
-        elif database.model == RELAY:
-            if not database.schema:
-                vlog.info('%s: relay database server has not yet connected '
-                          'to the relay source; trying another server'
-                          % session_name)
-                return False
-            if not database.connected:
-                vlog.info('%s: relay database server is disconnected '
-                          'from the relay source; trying another server'
-                          % session_name)
-                return False
-            if self.leader_only:
-                vlog.info('%s: relay database server cannot be a leader; '
-                          'trying another server' % session_name)
-                return False
-
-        return True
+            changed = self.__row_update(table, row, ru.columns)
+        table.rows[uuid] = row
+        if changed:
+            if ru.type == ovs.db.cs.ROW_UPDATE_XOR:
+                old = Row(self, table, uuid, old_row)
+            else:
+                old = Row.from_json(self, table, uuid, ru.old)
+            return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_UPDATE, row, old)
+        return OVSDB_IDL_UPDATE_NO_CHANGES, None
 
     def __column_name(self, column):
         if column.type.key.type == ovs.db.types.UuidType:
@@ -1278,9 +697,6 @@ class Idl(object):
 
     def __create_row(self, table, uuid):
         return Row(self, table, uuid, ColumnDefaultDict(table))
-
-    def __error(self):
-        self._session.force_reconnect()
 
     def __txn_abort_all(self):
         while self._outstanding_txns:
@@ -1906,14 +1322,13 @@ class Transaction(object):
         if self != self.idl.txn:
             return self._status
 
-        if self.idl.state != Idl.IDL_S_MONITORING:
-            self._status = Transaction.TRY_AGAIN
-            self.__disassemble()
-            return self._status
-
-        # If we need a lock but don't have it, give up quickly.
-        if self.idl.lock_name and not self.idl.has_lock:
-            self._status = Transaction.NOT_LOCKED
+        # The CS layer gates transaction submission on the session being in
+        # the MONITORING state and, if a lock is configured, on holding it.
+        if not self.idl.cs.may_send_transaction():
+            if self.idl.cs.get_lock() and not self.idl.cs.has_lock():
+                self._status = Transaction.NOT_LOCKED
+            else:
+                self._status = Transaction.TRY_AGAIN
             self.__disassemble()
             return self._status
 
@@ -2087,7 +1502,7 @@ class Transaction(object):
         else:
             msg = ovs.jsonrpc.Message.create_request("transact", operations)
             self._request_id = msg.id
-            if not self.idl._session.send(msg):
+            if not self.idl.cs.send(msg):
                 self.idl._outstanding_txns[self._request_id] = self
                 self._status = Transaction.INCOMPLETE
             else:

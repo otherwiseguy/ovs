@@ -365,7 +365,7 @@ class Connection(object):
 class Session(object):
     """A JSON-RPC session with reconnection."""
 
-    def __init__(self, reconnect, rpc, remotes):
+    def __init__(self, reconnect, rpc, remotes, shuffle=True):
         self.reconnect = reconnect
         self.rpc = rpc
         self.stream = None
@@ -374,7 +374,8 @@ class Session(object):
         if type(remotes) is not list:
             remotes = [remotes]
         self.remotes = remotes
-        random.shuffle(self.remotes)
+        if shuffle:
+            random.shuffle(self.remotes)
         self.next_remote = 0
 
     @staticmethod
@@ -398,14 +399,18 @@ class Session(object):
         return Session.open_multiple([name], probe_interval=probe_interval)
 
     @staticmethod
-    def open_multiple(remotes, probe_interval=None):
+    def open_multiple(remotes, probe_interval=None, retry=True, shuffle=True):
         reconnect = ovs.reconnect.Reconnect(ovs.timeval.msec())
-        session = Session(reconnect, None, remotes)
+        session = Session(reconnect, None, remotes, shuffle=shuffle)
         session.pick_remote()
         reconnect.enable(ovs.timeval.msec())
         reconnect.set_backoff_free_tries(len(remotes))
         if ovs.stream.PassiveStream.is_valid_name(reconnect.get_name()):
             reconnect.set_passive(True, ovs.timeval.msec())
+        elif not retry:
+            # Make a single pass through the remotes, then give up.
+            reconnect.set_max_tries(len(remotes))
+            reconnect.set_backoff((1 << 31) - 1, (1 << 31) - 1)
 
         if not ovs.stream.stream_or_pstream_needs_probes(reconnect.get_name()):
             reconnect.set_probe_interval(0)
@@ -605,6 +610,12 @@ class Session(object):
 
     def force_reconnect(self):
         self.reconnect.force_reconnect(ovs.timeval.msec())
+
+    def enable_reconnect(self):
+        """Re-enables reconnection after the session was opened single-shot
+        (retry=False), restoring the default unlimited retries and backoff."""
+        self.reconnect.set_max_tries(None)
+        self.reconnect.set_backoff(1000, 8000)
 
     def reset_backoff(self):
         """ Resets the reconnect backoff by allowing as many free tries as the

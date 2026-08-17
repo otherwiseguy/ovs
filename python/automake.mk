@@ -8,6 +8,7 @@ ovs_pyfiles = \
 	python/ovs/daemon.py \
 	python/ovs/dns_resolve.py \
 	python/ovs/db/__init__.py \
+	python/ovs/db/cs.py \
 	python/ovs/db/custom_index.py \
 	python/ovs/db/data.py \
 	python/ovs/db/error.py \
