@@ -360,6 +360,11 @@ class Idl(object):
         database, so it must reconnect and re-download the whole database."""
         self.cs.flag_inconsistency()
 
+    def set_db_change_aware(self, db_change_aware):
+        """Passes 'db_change_aware' to Cs.set_db_change_aware().  See that
+        method for documentation."""
+        self.cs.set_db_change_aware(db_change_aware)
+
     def index_create(self, table, name):
         """Create a named multi-column index on a table"""
         return self.tables[table].rows.index_create(name)

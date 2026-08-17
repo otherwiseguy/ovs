@@ -931,6 +931,19 @@ class Cs(object):
     def get_condition_seqno(self):
         return self.data.cond_seqno
 
+    # Database change awareness.
+
+    def set_db_change_aware(self, db_change_aware):
+        """By default, or if 'db_change_aware' is True, the CS layer sends a
+        'set_db_change_aware' request to the server after receiving the _Server
+        data (when the server supports it), which is useful for clients that
+        intend to keep long connections to the server.  Otherwise, it will not
+        send the request, which is more reasonable for short-lived connections
+        to avoid unnecessary processing at the server side and possible error
+        handling due to connections being closed by the clients before the
+        responses are sent by the server."""
+        self.db_change_aware = db_change_aware
+
     # Locking.
 
     def set_lock(self, lock_name):
