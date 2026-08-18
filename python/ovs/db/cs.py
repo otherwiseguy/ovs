@@ -483,21 +483,40 @@ class Cs(object):
         if remote == self.remote:
             return
 
-        # Close the old session, if any.
+        rpc = None
+
+        # Close the old session, if any, stealing its open connection so it can
+        # be reused for the new session.
         if self.session is not None:
-            self.session.close()
+            rpc = self.session.steal()
             self.session = None
+            self.remote = None
 
         # Open the new session, if any.
         if remote is not None:
             remotes = self._parse_remotes(remote)
+            old_cluster_id = self.cluster_id
             self.session = ovs.jsonrpc.Session.open_multiple(
                 remotes, probe_interval=self._probe_interval, retry=retry,
                 shuffle=self.shuffle_remotes)
-            # Force the FSM to restart once (re)connected.
-            self._last_seqno = None
 
-        self.remote = remote
+            # Reuse the old connection if the cluster id didn't change and the
+            # currently connected remote is still on the list, to avoid an
+            # unnecessary reconnection and re-download of the database.
+            if (rpc is not None and old_cluster_id == self.cluster_id
+                    and rpc.name in remotes):
+                self.session.replace(rpc)
+                self._last_seqno = self.session.get_seqno()
+                rpc = None
+            else:
+                # Force the FSM to restart once (re)connected.
+                self._last_seqno = None
+
+            self.remote = remote
+
+        # Discard the stolen connection if it wasn't reused.
+        if rpc is not None:
+            rpc.close()
 
     def set_shuffle_remotes(self, shuffle):
         """Set whether the CS layer shuffles the order of the remotes each

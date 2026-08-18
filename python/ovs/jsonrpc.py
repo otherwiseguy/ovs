@@ -617,6 +617,27 @@ class Session(object):
         self.reconnect.set_max_tries(None)
         self.reconnect.set_backoff(1000, 8000)
 
+    def steal(self):
+        """Detaches and returns this session's open jsonrpc connection (if
+        any), then closes the session.  The caller takes ownership of the
+        returned connection and must close it (or hand it to another session
+        via replace()) itself."""
+        rpc = self.rpc
+        self.rpc = None
+        self.close()
+        return rpc
+
+    def replace(self, rpc):
+        """Replaces this session's connection with 'rpc' (as returned by
+        another session's steal()), closing the existing one if any.  Marks the
+        session as connected to 'rpc', avoiding an unnecessary reconnection."""
+        if self.rpc is not None:
+            self.rpc.close()
+        self.rpc = rpc
+        if self.rpc is not None:
+            self.reconnect.set_name(self.rpc.name)
+            self.reconnect.connected(ovs.timeval.msec())
+
     def reset_backoff(self):
         """ Resets the reconnect backoff by allowing as many free tries as the
         number of configured remotes.  This is to be used by upper layers
