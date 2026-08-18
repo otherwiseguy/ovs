@@ -39,6 +39,11 @@ OVSDB_UPDATE = "update"
 OVSDB_UPDATE2 = "update2"
 OVSDB_UPDATE3 = "update3"
 
+# Result of processing a single <row-update>.
+OVSDB_IDL_UPDATE_DB_CHANGED = 0
+OVSDB_IDL_UPDATE_NO_CHANGES = 1
+OVSDB_IDL_UPDATE_INCONSISTENT = 2
+
 CLUSTERED = "clustered"
 RELAY = "relay"
 
@@ -745,6 +750,16 @@ class Idl(object):
             self._session.reset_backoff()
         self._session.force_reconnect()
 
+    def flag_inconsistency(self):
+        """Tells the IDL that the client detected an inconsistency in the
+        database, so it must reconnect and re-download the whole database.
+
+        The 'last_id' is reset so that the IDL cannot request a fast resync
+        (monitor_cond_since) against the same server; instead the whole
+        database is re-downloaded, potentially from a different server."""
+        self.last_id = str(uuid.UUID(int=0))
+        self.force_reconnect()
+
     def session_name(self):
         return self._session.get_name()
 
@@ -922,14 +937,14 @@ class Idl(object):
     def __parse_update(self, update, version, tables=None):
         try:
             if not tables:
-                self.__do_parse_update(update, version, self.tables)
+                self._do_parse_update(update, version, self.tables)
             else:
-                self.__do_parse_update(update, version, tables)
+                self._do_parse_update(update, version, tables)
         except error.Error as e:
             vlog.err("%s: error parsing update: %s"
                      % (self._session.get_name(), e))
 
-    def __do_parse_update(self, table_updates, version, tables):
+    def _do_parse_update(self, table_updates, version, tables):
         if not isinstance(table_updates, dict):
             raise error.Error("<table-updates> is not an object",
                               table_updates)
@@ -962,44 +977,70 @@ class Idl(object):
                 self.cooperative_yield()
 
                 if version in (OVSDB_UPDATE2, OVSDB_UPDATE3):
-                    changes = self._process_update2(table, uuid, row_update)
-                    if changes and tables is not self.server_tables:
-                        notices.append(changes)
-                        self.change_seqno += 1
-                    continue
+                    result, notice = self._process_update2(table, uuid,
+                                                           row_update)
+                else:
+                    parser = ovs.db.parser.Parser(row_update, "row-update")
+                    old = parser.get_optional("old", [dict])
+                    new = parser.get_optional("new", [dict])
+                    parser.finish()
 
-                parser = ovs.db.parser.Parser(row_update, "row-update")
-                old = parser.get_optional("old", [dict])
-                new = parser.get_optional("new", [dict])
-                parser.finish()
+                    if not old and not new:
+                        raise error.Error('<row-update> missing "old" and '
+                                          '"new" members', row_update)
 
-                if not old and not new:
-                    raise error.Error('<row-update> missing "old" and '
-                                      '"new" members', row_update)
+                    result, notice = self._process_update(table, uuid,
+                                                          old, new)
 
-                changes = self.__process_update(table, uuid, old, new)
-                if changes and tables is not self.server_tables:
-                    notices.append(changes)
+                if result == OVSDB_IDL_UPDATE_INCONSISTENT:
+                    # The IDL ended up in an inconsistent state, e.g. because
+                    # of a bug in the ovsdb-server/ovsdb-idl.  Even though the
+                    # client could recover, it's best to reconnect and resync
+                    # the whole database (potentially from a different server).
+                    self.flag_inconsistency()
+                    raise error.Error("<row-update> received for inconsistent "
+                                      "IDL: reconnecting IDL and resync all "
+                                      "data")
+
+                if (result == OVSDB_IDL_UPDATE_DB_CHANGED
+                        and tables is not self.server_tables):
+                    notices.append(notice)
                     self.change_seqno += 1
         for notice in notices:
             self.notify(*notice)
 
     def _process_update2(self, table, uuid, row_update):
-        """Returns Notice if a column changed, False otherwise."""
+        """Returns a tuple (result, notice).
+
+        'result' is one of OVSDB_IDL_UPDATE_DB_CHANGED,
+        OVSDB_IDL_UPDATE_NO_CHANGES or OVSDB_IDL_UPDATE_INCONSISTENT, and
+        'notice' is a Notice describing the change or None.
+
+        Some IDL inconsistencies can be detected when processing updates:
+        - trying to insert an already existing row
+        - trying to update a missing row
+        - trying to delete a non existent row
+
+        In such cases OVSDB_IDL_UPDATE_INCONSISTENT is returned.  Even though
+        the client could recover, it's best to report the inconsistent state
+        because the state the server is in is unknown, so the safest thing to
+        do is to retry (potentially connecting to a new server)."""
         row = table.rows.get(uuid)
         if "delete" in row_update:
             if row:
                 del table.rows[uuid]
-                return Notice(ROW_DELETE, row)
+                return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_DELETE, row)
             else:
                 # XXX rate-limit
-                vlog.warn("cannot delete missing row %s from table"
-                          "%s" % (uuid, table.name))
+                vlog.err("cannot delete missing row %s from table %s"
+                         % (uuid, table.name))
+                return OVSDB_IDL_UPDATE_INCONSISTENT, None
         elif "insert" in row_update or "initial" in row_update:
             if row:
-                vlog.warn("cannot add existing row %s from table"
-                          " %s" % (uuid, table.name))
-                del table.rows[uuid]
+                # XXX rate-limit
+                vlog.err("cannot add existing row %s to table %s"
+                         % (uuid, table.name))
+                return OVSDB_IDL_UPDATE_INCONSISTENT, None
             row = self.__create_row(table, uuid)
             if "insert" in row_update:
                 row_update = row_update['insert']
@@ -1009,69 +1050,90 @@ class Idl(object):
             changed = self.__row_update(table, row, row_update)
             table.rows[uuid] = row
             if changed:
-                return Notice(ROW_CREATE, row)
+                return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_CREATE, row)
+            return OVSDB_IDL_UPDATE_NO_CHANGES, None
         elif "modify" in row_update:
             if not row:
-                raise error.Error('Modify non-existing row')
+                # XXX rate-limit
+                vlog.err("cannot modify missing row %s in table %s"
+                         % (uuid, table.name))
+                return OVSDB_IDL_UPDATE_INCONSISTENT, None
 
             del table.rows[uuid]
             old_row, changed = self._apply_diff(table, row,
                                                 row_update['modify'])
             table.rows[uuid] = row
             if changed:
-                return Notice(ROW_UPDATE, row, Row(self, table, uuid, old_row))
+                return (OVSDB_IDL_UPDATE_DB_CHANGED,
+                        Notice(ROW_UPDATE, row, Row(self, table, uuid,
+                                                    old_row)))
+            return OVSDB_IDL_UPDATE_NO_CHANGES, None
         else:
-            raise error.Error('<row-update> unknown operation',
-                              row_update)
-        return False
+            # XXX rate-limit
+            vlog.err("unknown operation in <row-update> for table %s"
+                     % table.name)
+            return OVSDB_IDL_UPDATE_NO_CHANGES, None
 
-    def __process_update(self, table, uuid, old, new):
-        """Returns Notice if a column changed, False otherwise."""
+    def _process_update(self, table, uuid, old, new):
+        """Returns a tuple (result, notice).
+
+        'result' is one of OVSDB_IDL_UPDATE_DB_CHANGED,
+        OVSDB_IDL_UPDATE_NO_CHANGES or OVSDB_IDL_UPDATE_INCONSISTENT, and
+        'notice' is a Notice describing the change or None.
+
+        Some IDL inconsistencies can be detected when processing updates:
+        - trying to insert an already existing row
+        - trying to update a missing row
+        - trying to delete a non existent row
+
+        In such cases OVSDB_IDL_UPDATE_INCONSISTENT is returned.  Even though
+        the client could recover, it's best to report the inconsistent state
+        because the state the server is in is unknown, so the safest thing to
+        do is to retry (potentially connecting to a new server)."""
         row = table.rows.get(uuid)
         changed = False
         if not new:
             # Delete row.
             if row:
                 del table.rows[uuid]
-                return Notice(ROW_DELETE, row)
+                return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_DELETE, row)
             else:
                 # XXX rate-limit
-                vlog.warn("cannot delete missing row %s from table %s"
-                          % (uuid, table.name))
+                vlog.err("cannot delete missing row %s from table %s"
+                         % (uuid, table.name))
+                return OVSDB_IDL_UPDATE_INCONSISTENT, None
         elif not old:
             # Insert row.
-            op = ROW_CREATE
             if not row:
                 row = self.__create_row(table, uuid)
                 changed = True
             else:
                 # XXX rate-limit
-                op = ROW_UPDATE
-                vlog.warn("cannot add existing row %s to table %s"
-                          % (uuid, table.name))
-                del table.rows[uuid]
+                vlog.err("cannot add existing row %s to table %s"
+                         % (uuid, table.name))
+                return OVSDB_IDL_UPDATE_INCONSISTENT, None
 
             changed |= self.__row_update(table, row, new)
             table.rows[uuid] = row
             if changed:
-                return Notice(ROW_CREATE, row)
+                return OVSDB_IDL_UPDATE_DB_CHANGED, Notice(ROW_CREATE, row)
+            return OVSDB_IDL_UPDATE_NO_CHANGES, None
         else:
-            op = ROW_UPDATE
+            # Modify row.
             if not row:
-                row = self.__create_row(table, uuid)
-                changed = True
-                op = ROW_CREATE
                 # XXX rate-limit
-                vlog.warn("cannot modify missing row %s in table %s"
-                          % (uuid, table.name))
-            else:
-                del table.rows[uuid]
+                vlog.err("cannot modify missing row %s in table %s"
+                         % (uuid, table.name))
+                return OVSDB_IDL_UPDATE_INCONSISTENT, None
 
+            del table.rows[uuid]
             changed |= self.__row_update(table, row, new)
             table.rows[uuid] = row
             if changed:
-                return Notice(op, row, Row.from_json(self, table, uuid, old))
-        return False
+                return (OVSDB_IDL_UPDATE_DB_CHANGED,
+                        Notice(ROW_UPDATE, row,
+                               Row.from_json(self, table, uuid, old)))
+            return OVSDB_IDL_UPDATE_NO_CHANGES, None
 
     def __check_server_db(self):
         """Returns True if this is a valid server database, False otherwise."""
