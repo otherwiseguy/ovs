@@ -1795,6 +1795,13 @@ class Transaction(object):
                         if isinstance(error, str):
                             if error == "timed out":
                                 soft_errors = True
+                            elif error == "unknown database":
+                                # ovsdb-server uses this error message to
+                                # indicate that the database in question was
+                                # removed, converted, etc.  Flag the IDL as
+                                # inconsistent so it reconnects and resyncs.
+                                self.idl.flag_inconsistency()
+                                soft_errors = True
                             elif error == "not owner":
                                 lock_errors = True
                             elif error == "not allowed":
