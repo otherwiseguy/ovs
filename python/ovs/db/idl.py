@@ -962,7 +962,7 @@ class Idl(object):
                 self.cooperative_yield()
 
                 if version in (OVSDB_UPDATE2, OVSDB_UPDATE3):
-                    changes = self.__process_update2(table, uuid, row_update)
+                    changes = self._process_update2(table, uuid, row_update)
                     if changes and tables is not self.server_tables:
                         notices.append(changes)
                         self.change_seqno += 1
@@ -984,7 +984,7 @@ class Idl(object):
         for notice in notices:
             self.notify(*notice)
 
-    def __process_update2(self, table, uuid, row_update):
+    def _process_update2(self, table, uuid, row_update):
         """Returns Notice if a column changed, False otherwise."""
         row = table.rows.get(uuid)
         if "delete" in row_update:
@@ -1015,9 +1015,11 @@ class Idl(object):
                 raise error.Error('Modify non-existing row')
 
             del table.rows[uuid]
-            old_row = self.__apply_diff(table, row, row_update['modify'])
+            old_row, changed = self._apply_diff(table, row,
+                                                row_update['modify'])
             table.rows[uuid] = row
-            return Notice(ROW_UPDATE, row, Row(self, table, uuid, old_row))
+            if changed:
+                return Notice(ROW_UPDATE, row, Row(self, table, uuid, old_row))
         else:
             raise error.Error('<row-update> unknown operation',
                               row_update)
@@ -1152,8 +1154,9 @@ class Idl(object):
                     if column.type.n_min != 0 and not column.type.is_map():
                         row_update[column.name] = self.__column_name(column)
 
-    def __apply_diff(self, table, row, row_diff):
+    def _apply_diff(self, table, row, row_diff):
         old_row = {}
+        changed = False
         for column_name, datum_diff_json in row_diff.items():
             column = table.columns.get(column_name)
             if not column:
@@ -1170,12 +1173,18 @@ class Idl(object):
                           % (column_name, table.name, e))
                 continue
 
-            old_row[column_name] = row._data[column_name].copy()
+            # Datum.diff() mutates the datum in place for sets and maps and
+            # returns 'self', so compare the new value against the pre-diff
+            # copy rather than against row._data[column_name] (which diff()
+            # may already have updated).
+            old = row._data[column_name].copy()
+            old_row[column_name] = old
             datum = row._data[column_name].diff(datum_diff)
-            if datum != row._data[column_name]:
-                row._data[column_name] = datum
+            row._data[column_name] = datum
+            if datum != old and column.alert:
+                changed = True
 
-        return old_row
+        return old_row, changed
 
     def __row_update(self, table, row, row_json):
         changed = False
