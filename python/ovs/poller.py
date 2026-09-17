@@ -110,9 +110,23 @@ class _SelectSelect(object):
 
 
 SelectPoll = _SelectSelect
-# If eventlet/gevent isn't used, we can use select.poll by replacing
-# _SelectPoll with select.poll class
-# _SelectPoll = select.poll
+
+
+def _get_poll():
+    """Return a poll object suitable for the current environment.
+
+    Under eventlet or gevent, select.select is replaced by a green
+    implementation that multiplexes through the hub.  _SelectSelect is
+    therefore both cooperative and free of the FD_SETSIZE limit there, so
+    keep using it.  Everywhere else select.select is the real select(2),
+    which cannot handle a file descriptor numbered FD_SETSIZE or higher, so
+    use poll(2), which has no such limit.
+    """
+    if _using_eventlet_green_select() or (
+            gevent_monkey and
+            gevent_monkey.is_object_patched('select', 'select')):
+        return _SelectSelect()
+    return select.poll()
 
 
 class Poller(object):
@@ -220,7 +234,7 @@ class Poller(object):
                     vlog.dbg("%s on fd %d" % (s, fd))
 
     def __reset(self):
-        self.poll = SelectPoll()
+        self.poll = _get_poll()
         self.timeout = -1
 
 
