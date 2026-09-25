@@ -21,6 +21,7 @@
 #include "bitmap.h"
 #include "column.h"
 #include "cooperative-multitasking.h"
+#include "coverage.h"
 #include "openvswitch/dynamic-string.h"
 #include "openvswitch/json.h"
 #include "json.h"
@@ -42,11 +43,14 @@
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_monitor);
 
+COVERAGE_DEFINE(ovsdb_monitor_table_cache_hit);
+COVERAGE_DEFINE(ovsdb_monitor_table_cache_miss);
+
 static struct hmap ovsdb_monitors = HMAP_INITIALIZER(&ovsdb_monitors);
 
 /* Keep state of session's conditions */
 struct ovsdb_monitor_session_condition {
-    bool conditional;        /* True iff every table's condition is true. */
+    bool conditional;        /* True if any table's condition is not true. */
     struct shash tables;     /* Contains
                               *   "struct ovsdb_monitor_table_condition *"s. */
 };
@@ -167,6 +171,13 @@ struct ovsdb_monitor_change_set_for_table {
      * mt->n_columns can be increased when there are condition changes
      * from any of the clients sharing the dbmon. */
     size_t n_columns;
+
+    /* Serialized update2 table data for unconditional tables in otherwise
+     * conditional monitors.  Both V2 and V3 use the same row representation.
+     * The change set determines whether this is an initial reply or an update.
+     * A valid cache may be NULL if there is nothing to report. */
+    struct json *json;
+    bool json_valid;
 };
 
 /* A particular table being monitored. */
@@ -673,6 +684,7 @@ ovsdb_monitor_change_set_destroy(struct ovsdb_monitor_change_set *mcs)
         }
         hmap_destroy(&mcst->rows);
 
+        json_destroy_with_yield(mcst->json);
         free(mcst);
     }
     free(mcs);
@@ -1130,26 +1142,49 @@ ovsdb_monitor_max_columns(struct ovsdb_monitor *dbmon)
 }
 
 static void
-ovsdb_monitor_add_json_row(struct json **json, const char *table_name,
-                           struct json **table_json, struct json *row_json,
-                           const struct uuid *row_uuid)
+ovsdb_monitor_add_json_row(struct json **table_json, struct json *row_json,
+                          const struct uuid *row_uuid)
 {
     char uuid[UUID_LEN + 1];
-
-    /* Create JSON object for transaction overall. */
-    if (!*json) {
-        *json = json_object_create();
-    }
 
     /* Create JSON object for transaction on this table. */
     if (!*table_json) {
         *table_json = json_object_create();
-        json_object_put(*json, table_name, *table_json);
     }
 
     /* Add JSON row to JSON table. */
     snprintf(uuid, sizeof uuid, UUID_FMT, UUID_ARGS(row_uuid));
     json_object_put(*table_json, uuid, row_json);
+}
+
+/* Adds a table update, taking ownership of 'table_json'.  Empty table updates
+ * are omitted, including when the cached result is NULL. */
+static void
+ovsdb_monitor_add_json_table(struct json **json, const char *table_name,
+                            struct json *table_json)
+{
+    if (table_json) {
+        if (!*json) {
+            *json = json_object_create();
+        }
+        json_object_put(*json, table_name, table_json);
+    }
+}
+
+/* Only unconditional tables can share their complete encoded updates between
+ * sessions with different conditions.  Condition-change updates are composed
+ * separately and must never use this cache. */
+static bool
+ovsdb_monitor_table_is_unconditional(
+    const struct ovsdb_monitor_table *mt,
+    const struct ovsdb_monitor_session_condition *condition)
+{
+    struct ovsdb_condition *old_condition, *new_condition, *diff_condition;
+
+    return !ovsdb_monitor_get_table_conditions(mt, condition, &old_condition,
+                                               &new_condition, &diff_condition)
+           || (ovsdb_condition_is_true(old_condition)
+               && ovsdb_condition_is_true(new_condition));
 }
 
 /* Constructs and returns JSON for a <table-updates> object (as described in
@@ -1173,6 +1208,19 @@ ovsdb_monitor_compose_update(
         struct json *table_json = NULL;
         struct ovsdb_monitor_table *mt = mcst->mt;
 
+        /* Fully unconditional monitors already have a whole-update cache.
+         * Keep that fast path, without also retaining per-table copies. */
+        bool cache_table = row_update == ovsdb_monitor_compose_row_update2
+                           && condition && condition->conditional
+                           && ovsdb_monitor_table_is_unconditional(mt,
+                                                                   condition);
+        if (cache_table && mcst->json_valid) {
+            COVERAGE_INC(ovsdb_monitor_table_cache_hit);
+            ovsdb_monitor_add_json_table(&json, mt->table->schema->name,
+                                         json_nullable_clone(mcst->json));
+            continue;
+        }
+
         HMAP_FOR_EACH_SAFE (row, hmap_node, &mcst->rows) {
             cooperative_multitasking_yield();
 
@@ -1180,11 +1228,22 @@ ovsdb_monitor_compose_update(
             row_json = (*row_update)(mt, condition, OVSDB_MONITOR_ROW, row,
                                      initial, changed, mcst->n_columns);
             if (row_json) {
-                ovsdb_monitor_add_json_row(&json, mt->table->schema->name,
-                                           &table_json, row_json,
-                                           &row->uuid);
+                ovsdb_monitor_add_json_row(&table_json, row_json, &row->uuid);
             }
         }
+
+        if (cache_table) {
+            COVERAGE_INC(ovsdb_monitor_table_cache_miss);
+            if (table_json) {
+                mcst->json =
+                    json_serialized_object_create_with_yield(table_json);
+                json_destroy_with_yield(table_json);
+                table_json = json_clone(mcst->json);
+            }
+            mcst->json_valid = true;
+        }
+        ovsdb_monitor_add_json_table(&json, mt->table->schema->name,
+                                     table_json);
     }
     free(changed);
 
@@ -1228,11 +1287,12 @@ ovsdb_monitor_compose_cond_change_update(
                                                          false, changed,
                                                          mt->n_columns);
             if (row_json) {
-                ovsdb_monitor_add_json_row(&json, mt->table->schema->name,
-                                           &table_json, row_json,
-                                           ovsdb_row_get_uuid(row));
+                ovsdb_monitor_add_json_row(&table_json, row_json,
+                                          ovsdb_row_get_uuid(row));
             }
         }
+        ovsdb_monitor_add_json_table(&json, mt->table->schema->name,
+                                     table_json);
         ovsdb_monitor_table_condition_updated(mt, condition);
     }
     free(changed);
@@ -1385,6 +1445,13 @@ ovsdb_monitor_changes_update(const struct ovsdb_row *old,
                              struct ovsdb_monitor_change_set_for_table *mcst)
 {
     ovs_assert(new || old);
+
+    /* This also invalidates initial snapshots for internal-only changes,
+     * such as an insertion when the monitor selects only initial data. */
+    json_destroy_with_yield(mcst->json);
+    mcst->json = NULL;
+    mcst->json_valid = false;
+
     const struct uuid *uuid = ovsdb_row_get_uuid(new ? new : old);
     struct ovsdb_monitor_row *change = NULL;
 
@@ -1842,6 +1909,14 @@ ovsdb_monitor_get_memory_usage(struct simap *usage)
 
     HMAP_FOR_EACH(dbmon, hmap_node,  &ovsdb_monitors) {
         simap_increase(usage, "json-caches", hmap_count(&dbmon->json_cache));
+        struct ovsdb_monitor_change_set *mcs;
+        LIST_FOR_EACH (mcs, list_node, &dbmon->change_sets) {
+            struct ovsdb_monitor_change_set_for_table *mcst;
+            LIST_FOR_EACH (mcst, list_in_change_set,
+                           &mcs->change_set_for_tables) {
+                simap_increase(usage, "json-table-caches", mcst->json_valid);
+            }
+        }
     }
 }
 

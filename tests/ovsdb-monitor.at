@@ -1072,3 +1072,187 @@ row,action,name
 <1>,initial,"""zero"""
 ])
 AT_CLEANUP
+
+m4_define([OVSDB_CHECK_MONITOR_TABLE_CACHE], [
+AT_SETUP([$1 per-table cache])
+AT_KEYWORDS([ovsdb server monitor monitor-cond monitor-table-cache])
+AT_DATA([schema], [[
+{"name": "cache", "tables": {
+  "public": {"isRoot": true, "columns": {
+    "number": {"type": "integer"},
+    "tags": {"type": {"key": "string", "min": 0, "max": "unlimited"}}
+  }},
+  "private": {"isRoot": true, "columns": {
+    "name": {"type": "string"}, "number": {"type": "integer"}
+  }}
+}}
+]])
+AT_CHECK([ovsdb-tool create db schema])
+AT_CAPTURE_FILE([ovsdb-server.log])
+AT_CHECK([ovsdb-server --detach --no-chdir --pidfile --log-file \
+            --remote=punix:socket db], [0], [], [ignore])
+on_exit 'kill `cat ovsdb-server.pid`'
+
+AT_DATA([client.py], [[
+import sys
+
+import ovs.jsonrpc
+import ovs.stream
+from ovs.fatal_signal import signal_alarm
+
+signal_alarm(30)
+
+
+class Client:
+    def __init__(self):
+        error, stream = ovs.stream.Stream.open_block(
+            ovs.stream.Stream.open("unix:socket"))
+        assert not error, error
+        self.rpc = ovs.jsonrpc.Connection(stream)
+        self.updates = []
+
+    def request(self, method, params):
+        request = ovs.jsonrpc.Message.create_request(method, params)
+        assert not self.rpc.send_block(request)
+        while True:
+            error, reply = self.rpc.recv_block()
+            assert not error, error
+            if reply.type == ovs.jsonrpc.Message.T_NOTIFY:
+                assert reply.method in ("update2", "update3"), reply
+                self.updates.append(reply.params[-1])
+            else:
+                assert reply.id == request.id, reply
+                assert reply.error is None, reply.error
+                return reply.result
+
+    def check(self, expected=None):
+        # The server flushes monitor updates before sending a reply.
+        self.request("echo", [])
+        assert self.updates == ([expected] if expected else []), self.updates
+        self.updates.clear()
+
+    def change(self, table, where):
+        self.request("monitor_cond_change",
+                     ["m", "m", {table: [{"where": where}]}])
+
+
+method = sys.argv[1]
+other_method = ("monitor_cond_since" if method == "monitor_cond"
+                else "monitor_cond")
+writer = Client()
+clients = [writer]
+
+
+def transact(*ops):
+    result = writer.request("transact", ["cache"] + list(ops))
+    assert all("error" not in op for op in result), result
+    return result
+
+
+def monitor(where, protocol=method, select=None):
+    client = Client()
+    clients.append(client)
+    tables = {"public": [{"columns": ["number", "tags"], "where": [True]}],
+              "private": [{"columns": ["name", "number"], "where": where}]}
+    if select is not None:
+        tables["public"][0]["select"] = select
+    params = ["cache", "m", tables]
+    if protocol == "monitor_cond_since":
+        params.append("00000000-0000-0000-0000-000000000000")
+    result = client.request(protocol, params)
+    return client, result[-1] if protocol == "monitor_cond_since" else result
+
+
+def insert(table, row):
+    return {"op": "insert", "table": table, "row": row}
+
+
+def update(table, row):
+    return {"op": "update", "table": table, "where": [], "row": row}
+
+
+result = transact(insert("private", {"name": "a"}),
+                  insert("private", {"name": "b"}))
+aid, bid = (op["uuid"][1] for op in result)
+a, initial = monitor([["name", "==", "a"]])
+assert initial == {"private": {aid: {"initial": {"name": "a"}}}}, initial
+# Reuse an empty public-table snapshot across both monitor versions.
+b, initial = monitor([["name", "==", "b"]], other_method)
+assert initial == {"private": {bid: {"initial": {"name": "b"}}}}, initial
+# A whole-monitor cache must coexist with the per-table cache.
+all_rows, initial = monitor([True])
+assert len(initial["private"]) == 2, initial
+
+# Both tables must still arrive in one atomic notification, without leaking
+# private rows between clients.
+result = transact(insert("public", {"number": 1, "tags": ["set", ["x", "y"]]}),
+                  update("private", {"number": 1}))
+pid = result[0]["uuid"][1]
+public_insert = {pid: {"insert": {"number": 1, "tags": ["set", ["x", "y"]]}}}
+a.check({"public": public_insert, "private": {aid: {"modify": {"number": 1}}}})
+b.check({"public": public_insert, "private": {bid: {"modify": {"number": 1}}}})
+all_rows.check({"public": public_insert,
+                "private": {rid: {"modify": {"number": 1}} for rid in (aid, bid)}})
+
+# Invalidate both pending updates and the retained initial snapshot.
+transact(update("public", {"number": 2, "tags": ["set", ["y", "z"]]}))
+modified = {"public": {pid: {"modify": {
+    "number": 2, "tags": ["set", ["x", "z"]]}}}}
+for client in (a, b, all_rows):
+    client.check(modified)
+c, initial = monitor([["name", "==", "a"]])
+assert initial["public"] == {pid: {"initial": {
+    "number": 2, "tags": ["set", ["y", "z"]]}}}, initial
+
+# Switch a formerly cached table to a filter and back.  Condition-change
+# inserts/deletes must not be confused with cached database updates.
+a.change("public", [["number", "==", 3]])
+a.check({"public": {pid: {"delete": None}}})
+transact(update("public", {"number": 3}))
+a.check({"public": {pid: {"insert": {
+    "number": 3, "tags": ["set", ["y", "z"]]}}}})
+for client in (b, c, all_rows):
+    client.check({"public": {pid: {"modify": {"number": 3}}}})
+a.change("public", [True])
+a.check()
+# Also exercise the transition to a wholly unconditional monitor and back.
+a.change("private", [True])
+a.check({"private": {bid: {"insert": {"name": "b", "number": 1}}}})
+a.change("private", [["name", "==", "a"]])
+a.check({"private": {bid: {"delete": None}}})
+transact({"op": "delete", "table": "public", "where": []})
+for client in (a, b, c, all_rows):
+    client.check({"public": {pid: {"delete": None}}})
+
+# Internal-only changes must invalidate cached initial data even when no
+# existing client selected notifications for those changes.
+select = {"initial": True, "insert": False, "delete": False, "modify": False}
+d, initial = monitor([["name", "==", "a"]], select=select)
+assert "public" not in initial, initial
+result = transact(insert("public", {"number": 4}))
+pid = result[0]["uuid"][1]
+d.check()
+e, initial = monitor([["name", "==", "b"]], select=select)
+assert initial["public"] == {pid: {"initial": {"number": 4}}}, initial
+transact(update("public", {"number": 5}))
+d.check()
+e.check()
+f, initial = monitor([["name", "==", "a"]], select=select)
+assert initial["public"] == {pid: {"initial": {"number": 5}}}, initial
+
+for client in clients:
+    if client is not writer:
+        client.request("monitor_cancel", ["m"])
+    client.rpc.close()
+]])
+AT_CHECK([$PYTHON3 client.py $1])
+# The functional checks above must actually exercise shared table fragments.
+AT_CHECK([ovs-appctl -t ovsdb-server coverage/read-counter \
+            ovsdb_monitor_table_cache_hit > hits])
+AT_CHECK([test "`cat hits`" -gt 0])
+OVSDB_SERVER_SHUTDOWN
+AT_CLEANUP
+])
+
+OVSDB_CHECK_MONITOR_TABLE_CACHE([monitor_cond])
+OVSDB_CHECK_MONITOR_TABLE_CACHE([monitor_cond_since])
